@@ -68,7 +68,7 @@ bool is_threshold( const TT& tt, std::vector<int64_t>* plf = nullptr )
   /* TODO */
 
   auto Nvar = tt.num_vars();
-  auto tt_flip = tt;
+  auto flip_tt = tt;
   std::vector<bool> flip_flag;
 
   // check for tt to be unate or binate & convert it into a positive unate
@@ -79,18 +79,15 @@ bool is_threshold( const TT& tt, std::vector<int64_t>* plf = nullptr )
 
     if (implies(neg_cof, pos_cof)) //positive unate in variable i
     {
-      //std::cout<< "The function is positive unate in variable " << i << std::endl;
       flip_flag.emplace_back(false); //no flip has occurred for variable i
     }
     else if(implies(pos_cof, neg_cof)) //negarive unate in variable i
     {
-      //std::cout << "The function is negative unate in variable " << i << std::endl;
-      tt_flip = flip( tt_flip, i );
+      flip_tt = flip( flip_tt, i );
       flip_flag.emplace_back(true); //flip for variable i
     }
     else
     {
-      //std::cout << "The function is not a TF, it is binate in variable " << i << std::endl;
       return false;
     }
   }
@@ -98,7 +95,7 @@ bool is_threshold( const TT& tt, std::vector<int64_t>* plf = nullptr )
   lprec* lp;
   int *num_col = nullptr, j;
   bool flag = false;
-  REAL* row = nullptr;
+  REAL* weights = nullptr;
 
   /* We will build the model row by row */
   int Ncol = Nvar + 1;
@@ -111,16 +108,15 @@ bool is_threshold( const TT& tt, std::vector<int64_t>* plf = nullptr )
   {
     /* create space large enough for one row */
     num_col = (int*)malloc( Ncol * sizeof( *num_col ) );
-    row = (REAL*)malloc( Ncol * sizeof( *row ) );
-    if ( ( num_col == nullptr ) || ( row == nullptr ) )
+    weights = (REAL*)malloc( Ncol * sizeof( *weights ) );
+    if ( ( num_col == nullptr ) || ( weights == nullptr ) )
       flag = true;
   }
 
-  std::vector<cube> tt_on_set = isop( tt_flip ); //get the onset of the tt
-  std::vector<cube> tt_off_set = isop( unary_not( tt_flip ) );  //get the offset of tt
   set_add_rowmode( lp, TRUE );
   if (!flag)
   {
+    std::vector<cube> tt_on_set = isop( flip_tt ); //get the onset of the tt
     for ( cube cb : tt_on_set ) // Constraints for on_set
     {
       j = 0;
@@ -128,21 +124,21 @@ bool is_threshold( const TT& tt, std::vector<int64_t>* plf = nullptr )
       {
         num_col[j] = i + 1;
         if ( cb.get_mask( i ) ) // if variable is in cube
-          row[j] = 1;
+          weights[j] = 1;
         else
-          row[j] = 0;
+          weights[j] = 0;
         ++j;
       }
       num_col[j] = T;
-      row[j] = -1;
-      ++j;
-      if ( !add_constraintex( lp, j, row, num_col, GE, 0 ) )
+      weights[j] = - 1;
+      if ( !add_constraintex( lp, j + 1, weights, num_col, GE, 0 ) )
         flag = true;
     }
   }
 
   if (!flag)
   {
+    std::vector<cube> tt_off_set = isop( unary_not( flip_tt ) );  //get the offset of tt
     for ( cube cb : tt_off_set )  // Constrains for off_set
     {
       j = 0;
@@ -150,17 +146,30 @@ bool is_threshold( const TT& tt, std::vector<int64_t>* plf = nullptr )
       {
         num_col[j] = i + 1;
         if ( !cb.get_mask( i ) ) //if the variable is not in cube
-          row[j] = 1;
+          weights[j] = 1;
         else
-          row[j] = 0;
+          weights[j] = 0;
         ++j;
       }
       num_col[j] = T;
-      row[j] = -1;
-      ++j;
-      if ( !add_constraintex( lp, j, row, num_col, LE, - 1 ) )
+      weights[j] = - 1;
+      if ( !add_constraintex( lp, j + 1, weights, num_col, LE, - 1 ) )
         flag = true;
     }
+  }
+
+  /* set the objective function : min(sum(w_i) + T) */
+  if (!flag)
+  {
+    //num_col[Ncol - 1] = T;
+    for ( int f = 0; f < Ncol; ++f )
+    {
+      num_col[f] = f + 1;
+      weights[f] = 1;
+    }
+    /* set the objective in lpsolve */
+    if ( !set_obj_fnex( lp, Ncol, weights, num_col ) )
+      flag = true;
   }
 
   if (!flag)
@@ -172,73 +181,58 @@ bool is_threshold( const TT& tt, std::vector<int64_t>* plf = nullptr )
         if ( m == n )
         {
           num_col[m] = m + 1;
-          row[m] = 1;
+          weights[m] = 1;
         }
         else
         {
           num_col[n] = n + 1;
-          row[n] = 0;
+          weights[n] = 0;
         }
       }
-      if ( !add_constraintex( lp, Ncol, row, num_col, GE, 0 ) )
+      if ( !add_constraintex( lp, Ncol, weights, num_col, GE, 0 ) )
         flag = false;
     }
   }
 
   set_add_rowmode( lp, FALSE );
 
-  /* set the objective function : min(sum(w_i) + T) */
-  if (!flag)
-  {
-    for ( int f = 0; f < Ncol; ++f )
-    {
-      num_col[f] = f + 1;
-      row[f] = 1;
-    }
-    /* set the objective in lpsolve */
-    if ( !set_obj_fnex( lp, Ncol, row, num_col ) )
-      flag = true;
-  }
-
   /* set the object direction to minimize */
   set_minim( lp );
   set_verbose( lp, IMPORTANT );
   if ( solve( lp ) != OPTIMAL ) //Not a TF if LP doesn't give an optimal solution
     return false;
-  else
+
+  /* push the weight and threshold values into `linear_form` */
+  get_variables(lp, weights);
+  auto T_update = weights[Ncol-1];
+  for ( j = 0; j < Ncol -1; ++j)
   {
-    /* push the weight and threshold values into `linear_form` */
-    get_variables(lp, row);
-    auto new_T = row[Ncol-1];
-    for ( j = 0; j < Ncol -1; ++j)
+    if (!flip_flag[j])  //variable p not flipped
+      linear_form.emplace_back( weights[j] );
+    else  //variable p flipped
     {
-      if (!flip_flag[j])  //variable p not flipped
-        linear_form.emplace_back( row[j] );
-      else  //variable p flipped
-      {
-        linear_form.emplace_back( -row[j] );
-        new_T = new_T - row[j];  //updating the threshold
-      }
+      linear_form.emplace_back( -weights[j] );
+      T_update = T_update - weights[j];  //updating the threshold
     }
-    linear_form.emplace_back( new_T );
-    if ( plf )
-    {
-      *plf = linear_form;
-    }
-
-    /* free allocated memory */
-    if ( row != nullptr )
-      free( row );
-    if ( num_col != nullptr )
-      free( num_col );
-    if ( lp != nullptr )
-    {
-      /* clean up such that all used memory by lpsolve is freed */
-      delete_lp( lp );
-    }
-
-    return true;
   }
+  linear_form.emplace_back( T_update );
+  if ( plf )
+  {
+    *plf = linear_form;
+  }
+
+  /* free allocated memory */
+  if ( weights != nullptr )
+    free( weights );
+  if ( num_col != nullptr )
+    free( num_col );
+  if ( lp != nullptr )
+  {
+    /* clean up such that all used memory by lpsolve is freed */
+    delete_lp( lp );
+  }
+
+  return true;
 }
 
 } /* namespace kitty */
